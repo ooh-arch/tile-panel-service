@@ -10,6 +10,8 @@ import os
 import math
 import hashlib
 
+SERVICE_VERSION = "TILE_PANEL_SERVICE_AUTO_PL_FACE_V2"
+
 app = FastAPI(title="Tile Panel Service")
 
 cloudinary.config(
@@ -93,6 +95,351 @@ def fit_to_tile(img: Image.Image, width_px: int, height_px: int) -> Image.Image:
     return ImageOps.fit(img, (width_px, height_px), method=Image.LANCZOS)
 
 
+def _smooth_signal(values, radius: int = 2):
+    if not values:
+        return []
+
+    smoothed = []
+    for index in range(len(values)):
+        start = max(0, index - radius)
+        end = min(len(values), index + radius + 1)
+        window = values[start:end]
+        smoothed.append(sum(window) / max(1, len(window)))
+
+    return smoothed
+
+
+def _axis_boundary_signal(img: Image.Image, axis: str):
+    """
+    Build a lightweight seam signal without OpenCV or NumPy.
+
+    The signal combines:
+    - average pixel difference across neighboring columns/rows
+    - average brightness deviation, which helps with light grout lines
+    """
+    analysis = img.convert("L")
+
+    max_analysis_side = 900
+    scale = min(
+        1.0,
+        max_analysis_side / max(analysis.width, analysis.height)
+    )
+
+    if scale < 1.0:
+        analysis = analysis.resize(
+            (
+                max(2, round(analysis.width * scale)),
+                max(2, round(analysis.height * scale))
+            ),
+            Image.Resampling.BILINEAR
+        )
+
+    pixels = analysis.load()
+    width, height = analysis.size
+
+    if axis == "x":
+        length = width
+        cross_length = height
+
+        means = []
+        gradients = []
+
+        for x in range(width):
+            total = 0.0
+            diff_total = 0.0
+
+            for y in range(height):
+                value = pixels[x, y]
+                total += value
+
+                if x > 0:
+                    diff_total += abs(value - pixels[x - 1, y])
+
+            means.append(total / max(1, cross_length))
+            gradients.append(diff_total / max(1, cross_length))
+    else:
+        length = height
+        cross_length = width
+
+        means = []
+        gradients = []
+
+        for y in range(height):
+            total = 0.0
+            diff_total = 0.0
+
+            for x in range(width):
+                value = pixels[x, y]
+                total += value
+
+                if y > 0:
+                    diff_total += abs(value - pixels[x, y - 1])
+
+            means.append(total / max(1, cross_length))
+            gradients.append(diff_total / max(1, cross_length))
+
+    mean_level = sum(means) / max(1, len(means))
+    brightness_deviation = [abs(value - mean_level) for value in means]
+
+    smooth_gradient = _smooth_signal(gradients, radius=1)
+    smooth_brightness = _smooth_signal(brightness_deviation, radius=2)
+
+    gradient_mean = sum(smooth_gradient) / max(1, len(smooth_gradient))
+    brightness_mean = sum(smooth_brightness) / max(1, len(smooth_brightness))
+
+    signal = []
+
+    for gradient_value, brightness_value in zip(
+        smooth_gradient,
+        smooth_brightness
+    ):
+        gradient_score = gradient_value / max(0.001, gradient_mean)
+        brightness_score = brightness_value / max(0.001, brightness_mean)
+
+        signal.append(
+            (gradient_score * 0.72) +
+            (brightness_score * 0.28)
+        )
+
+    return signal, length
+
+
+def _candidate_grid_count(
+    signal,
+    axis_length: int,
+    min_count: int = 2,
+    max_count: int = 30
+):
+    """
+    Estimate how many repeated cells exist along one axis.
+
+    It scores equally spaced internal boundaries against nearby seam peaks.
+    A conservative confidence gate prevents normal single-tile images from
+    being split accidentally.
+    """
+    if axis_length < 40 or not signal:
+        return 1, 0.0
+
+    max_count = min(max_count, max(2, axis_length // 18))
+
+    best_count = 1
+    best_score = 0.0
+    second_score = 0.0
+
+    baseline_sorted = sorted(signal)
+    baseline_index = max(
+        0,
+        min(len(baseline_sorted) - 1, round(len(baseline_sorted) * 0.65))
+    )
+    baseline = max(0.001, baseline_sorted[baseline_index])
+
+    for count in range(min_count, max_count + 1):
+        spacing = axis_length / count
+
+        if spacing < 18:
+            continue
+
+        local_radius = max(1, min(5, round(spacing * 0.035)))
+        boundary_scores = []
+
+        for boundary_index in range(1, count):
+            expected = round(boundary_index * spacing)
+            start = max(1, expected - local_radius)
+            end = min(len(signal) - 1, expected + local_radius)
+
+            if start > end:
+                continue
+
+            local_peak = max(signal[start:end + 1])
+            boundary_scores.append(local_peak / baseline)
+
+        if not boundary_scores:
+            continue
+
+        average_score = sum(boundary_scores) / len(boundary_scores)
+        strong_ratio = (
+            sum(1 for value in boundary_scores if value >= 1.22)
+            / len(boundary_scores)
+        )
+        weak_ratio = (
+            sum(1 for value in boundary_scores if value >= 1.08)
+            / len(boundary_scores)
+        )
+
+        # Prefer candidates whose expected boundaries repeatedly coincide
+        # with actual projection peaks.
+        score = (
+            average_score * 0.55 +
+            strong_ratio * 0.30 +
+            weak_ratio * 0.15
+        )
+
+        # Very large counts can overfit surface texture. Apply a mild penalty.
+        score -= max(0, count - 16) * 0.008
+
+        if score > best_score:
+            second_score = best_score
+            best_score = score
+            best_count = count
+        elif score > second_score:
+            second_score = score
+
+    confidence_gap = best_score - second_score
+
+    if best_score < 0.93:
+        return 1, best_score
+
+    if best_score < 1.08 and confidence_gap < 0.035:
+        return 1, best_score
+
+    return best_count, best_score
+
+
+def _infer_panel_grid(
+    img: Image.Image,
+    tile_width_cm: float,
+    tile_height_cm: float
+):
+    """
+    Infer a repeated face grid from a legacy _pl image.
+
+    The image is split only when:
+    - both axes show a plausible repeated grid, and
+    - inferred cell aspect ratio is compatible with the real tile aspect.
+
+    Otherwise the function safely returns 1 x 1.
+    """
+    x_signal, x_length = _axis_boundary_signal(img, "x")
+    y_signal, y_length = _axis_boundary_signal(img, "y")
+
+    cols, x_score = _candidate_grid_count(x_signal, x_length)
+    rows, y_score = _candidate_grid_count(y_signal, y_length)
+
+    if cols <= 1 or rows <= 1:
+        return 1, 1, {
+            "detected": False,
+            "reason": "grid_confidence_low",
+            "x_score": round(x_score, 4),
+            "y_score": round(y_score, 4)
+        }
+
+    source_cell_ratio = (
+        (img.width / cols) /
+        max(1e-6, (img.height / rows))
+    )
+    tile_ratio = tile_width_cm / max(1e-6, tile_height_cm)
+
+    ratio_error = abs(
+        math.log(
+            max(1e-6, source_cell_ratio) /
+            max(1e-6, tile_ratio)
+        )
+    )
+
+    # Accept a generous tolerance because legacy panels may include grout,
+    # small borders, or slightly non-square source pixels.
+    if ratio_error > 0.34:
+        return 1, 1, {
+            "detected": False,
+            "reason": "cell_aspect_mismatch",
+            "x_score": round(x_score, 4),
+            "y_score": round(y_score, 4),
+            "source_cell_ratio": round(source_cell_ratio, 4),
+            "tile_ratio": round(tile_ratio, 4)
+        }
+
+    total_faces = cols * rows
+
+    if total_faces < 4 or total_faces > 900:
+        return 1, 1, {
+            "detected": False,
+            "reason": "face_count_out_of_range",
+            "x_score": round(x_score, 4),
+            "y_score": round(y_score, 4),
+            "total_faces": total_faces
+        }
+
+    return cols, rows, {
+        "detected": True,
+        "reason": "periodic_grid_detected",
+        "x_score": round(x_score, 4),
+        "y_score": round(y_score, 4),
+        "source_cell_ratio": round(source_cell_ratio, 4),
+        "tile_ratio": round(tile_ratio, 4),
+        "cols": cols,
+        "rows": rows,
+        "total_faces": total_faces
+    }
+
+
+def _extract_panel_faces(
+    img: Image.Image,
+    tile_width_cm: float,
+    tile_height_cm: float,
+    output_width_px: int,
+    output_height_px: int,
+    max_faces: int = 120
+):
+    """
+    Extract individual tile faces from a multi-tile _pl panel.
+
+    The crop boundaries are calculated from the inferred grid. A tiny inset
+    removes legacy grout pixels from each face before resizing.
+    """
+    cols, rows, detection = _infer_panel_grid(
+        img,
+        tile_width_cm,
+        tile_height_cm
+    )
+
+    if cols == 1 and rows == 1:
+        return [
+            fit_to_tile(img, output_width_px, output_height_px)
+        ], detection
+
+    face_images = []
+    cell_width = img.width / cols
+    cell_height = img.height / rows
+
+    inset_x = max(0, round(cell_width * 0.008))
+    inset_y = max(0, round(cell_height * 0.008))
+
+    for row in range(rows):
+        for col in range(cols):
+            left = round(col * cell_width) + inset_x
+            top = round(row * cell_height) + inset_y
+            right = round((col + 1) * cell_width) - inset_x
+            bottom = round((row + 1) * cell_height) - inset_y
+
+            if right <= left or bottom <= top:
+                continue
+
+            face = img.crop((left, top, right, bottom))
+            face_images.append(
+                fit_to_tile(face, output_width_px, output_height_px)
+            )
+
+            if len(face_images) >= max_faces:
+                break
+
+        if len(face_images) >= max_faces:
+            break
+
+    if not face_images:
+        return [
+            fit_to_tile(img, output_width_px, output_height_px)
+        ], {
+            **detection,
+            "detected": False,
+            "reason": "no_valid_face_crops"
+        }
+
+    detection["extracted_face_count"] = len(face_images)
+    detection["max_faces"] = max_faces
+
+    return face_images, detection
+
+
 def pick_face_index(row: int, col: int, face_count: int, rule: str, seed_key: str) -> int:
     if face_count <= 1:
         return 0
@@ -111,7 +458,8 @@ def pick_face_index(row: int, col: int, face_count: int, rule: str, seed_key: st
 def health():
     return {
         "ok": True,
-        "service": "tile-panel-service"
+        "service": "tile-panel-service",
+        "service_version": SERVICE_VERSION
     }
 
 
@@ -140,10 +488,29 @@ def create_panel(req: PanelRequest):
         grout_px = max(1, round((req.panel_grout_mm / 10.0) * ppcm))
 
         prepared_faces = []
+        face_extraction_meta = []
 
         for url in face_urls:
             img = download_image(url)
-            prepared_faces.append(fit_to_tile(img, tile_w_px, tile_h_px))
+
+            extracted_faces, extraction_meta = _extract_panel_faces(
+                img=img,
+                tile_width_cm=req.tile_width_cm,
+                tile_height_cm=req.tile_height_cm,
+                output_width_px=tile_w_px,
+                output_height_px=tile_h_px,
+                max_faces=max(1, min(120, int(req.random_face_count or 120)))
+                if int(req.random_face_count or 1) > 1
+                else 120
+            )
+
+            prepared_faces.extend(extracted_faces)
+            face_extraction_meta.append(
+                {
+                    "source_url": url,
+                    **extraction_meta
+                }
+            )
 
         cols = math.ceil(req.target_width_cm / req.tile_width_cm)
         rows = math.ceil(req.target_height_cm / req.tile_height_cm)
@@ -264,7 +631,10 @@ def create_panel(req: PanelRequest):
             "random_layout_rule": req.random_layout_rule,
             "tile_face_mode": req.tile_face_mode,
             "random_face_count": req.random_face_count,
-            "face_url_count": len(face_urls)
+            "face_url_count": len(face_urls),
+            "prepared_face_count": len(prepared_faces),
+            "face_extraction": face_extraction_meta,
+            "service_version": SERVICE_VERSION
         }
 
         return {
@@ -273,7 +643,7 @@ def create_panel(req: PanelRequest):
             "panel_key": req.panel_key,
             "stage_tile_panel_url": upload_result.get("secure_url", ""),
             "panel_status": "panel_ready",
-            "panel_version": "v1",
+            "panel_version": "auto_pl_face_v2",
             "panel_meta": panel_meta
         }
 
