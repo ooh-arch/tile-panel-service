@@ -10,7 +10,7 @@ import os
 import math
 import hashlib
 
-SERVICE_VERSION = "TILE_PANEL_SERVICE_AUTO_PL_FACE_V2"
+SERVICE_VERSION = "TILE_PANEL_SERVICE_AUTO_PL_FACE_V3"
 
 app = FastAPI(title="Tile Panel Service")
 
@@ -204,27 +204,24 @@ def _axis_boundary_signal(img: Image.Image, axis: str):
     return signal, length
 
 
-def _candidate_grid_count(
+
+def _score_grid_counts(
     signal,
     axis_length: int,
-    min_count: int = 2,
+    min_count: int = 1,
     max_count: int = 30
 ):
     """
-    Estimate how many repeated cells exist along one axis.
+    Return several plausible repeated-cell counts for one axis.
 
-    It scores equally spaced internal boundaries against nearby seam peaks.
-    A conservative confidence gate prevents normal single-tile images from
-    being split accidentally.
+    Unlike the older V2 logic, this function does not lock X and Y
+    independently. It returns ranked candidates so the final grid can be
+    selected as a compatible X/Y pair using the real tile aspect ratio.
     """
     if axis_length < 40 or not signal:
-        return 1, 0.0
+        return [(1, 0.0)]
 
     max_count = min(max_count, max(2, axis_length // 18))
-
-    best_count = 1
-    best_score = 0.0
-    second_score = 0.0
 
     baseline_sorted = sorted(signal)
     baseline_index = max(
@@ -233,13 +230,15 @@ def _candidate_grid_count(
     )
     baseline = max(0.001, baseline_sorted[baseline_index])
 
-    for count in range(min_count, max_count + 1):
+    candidates = [(1, 0.0)]
+
+    for count in range(max(2, min_count), max_count + 1):
         spacing = axis_length / count
 
         if spacing < 18:
             continue
 
-        local_radius = max(1, min(5, round(spacing * 0.035)))
+        local_radius = max(1, min(6, round(spacing * 0.04)))
         boundary_scores = []
 
         for boundary_index in range(1, count):
@@ -266,33 +265,19 @@ def _candidate_grid_count(
             / len(boundary_scores)
         )
 
-        # Prefer candidates whose expected boundaries repeatedly coincide
-        # with actual projection peaks.
         score = (
             average_score * 0.55 +
             strong_ratio * 0.30 +
             weak_ratio * 0.15
         )
 
-        # Very large counts can overfit surface texture. Apply a mild penalty.
         score -= max(0, count - 16) * 0.008
+        candidates.append((count, score))
 
-        if score > best_score:
-            second_score = best_score
-            best_score = score
-            best_count = count
-        elif score > second_score:
-            second_score = score
+    candidates.sort(key=lambda item: item[1], reverse=True)
 
-    confidence_gap = best_score - second_score
-
-    if best_score < 0.93:
-        return 1, best_score
-
-    if best_score < 1.08 and confidence_gap < 0.035:
-        return 1, best_score
-
-    return best_count, best_score
+    # Keep enough alternatives for pairwise aspect-ratio matching.
+    return candidates[:12]
 
 
 def _infer_panel_grid(
@@ -303,76 +288,131 @@ def _infer_panel_grid(
     """
     Infer a repeated face grid from a legacy _pl image.
 
-    The image is split only when:
-    - both axes show a plausible repeated grid, and
-    - inferred cell aspect ratio is compatible with the real tile aspect.
-
-    Otherwise the function safely returns 1 x 1.
+    V3 selects the X/Y grid as a pair. This prevents a strong but incompatible
+    X count and Y count from being chosen independently, which caused square
+    60x60 legacy panels to be rejected as 1.6667:1 cells in V2.
     """
     x_signal, x_length = _axis_boundary_signal(img, "x")
     y_signal, y_length = _axis_boundary_signal(img, "y")
 
-    cols, x_score = _candidate_grid_count(x_signal, x_length)
-    rows, y_score = _candidate_grid_count(y_signal, y_length)
+    x_candidates = _score_grid_counts(x_signal, x_length)
+    y_candidates = _score_grid_counts(y_signal, y_length)
 
-    if cols <= 1 or rows <= 1:
-        return 1, 1, {
-            "detected": False,
-            "reason": "grid_confidence_low",
-            "x_score": round(x_score, 4),
-            "y_score": round(y_score, 4)
-        }
-
-    source_cell_ratio = (
-        (img.width / cols) /
-        max(1e-6, (img.height / rows))
-    )
     tile_ratio = tile_width_cm / max(1e-6, tile_height_cm)
 
-    ratio_error = abs(
-        math.log(
-            max(1e-6, source_cell_ratio) /
-            max(1e-6, tile_ratio)
-        )
-    )
+    best_pair = None
+    best_pair_score = float("-inf")
 
-    # Accept a generous tolerance because legacy panels may include grout,
-    # small borders, or slightly non-square source pixels.
-    if ratio_error > 0.34:
+    for cols, x_score in x_candidates:
+        for rows, y_score in y_candidates:
+            if cols <= 1 or rows <= 1:
+                continue
+
+            total_faces = cols * rows
+
+            if total_faces < 4 or total_faces > 900:
+                continue
+
+            source_cell_ratio = (
+                (img.width / cols) /
+                max(1e-6, (img.height / rows))
+            )
+
+            ratio_error = abs(
+                math.log(
+                    max(1e-6, source_cell_ratio) /
+                    max(1e-6, tile_ratio)
+                )
+            )
+
+            # Reject clearly impossible cell shapes.
+            if ratio_error > 0.42:
+                continue
+
+            # Prefer seam evidence, then real tile aspect compatibility.
+            aspect_score = max(0.0, 1.0 - (ratio_error / 0.42))
+            pair_score = (
+                x_score * 0.38 +
+                y_score * 0.38 +
+                aspect_score * 0.52
+            )
+
+            # Mild penalty against implausibly dense grids.
+            pair_score -= max(0, total_faces - 144) * 0.0015
+
+            if pair_score > best_pair_score:
+                best_pair_score = pair_score
+                best_pair = {
+                    "cols": cols,
+                    "rows": rows,
+                    "x_score": x_score,
+                    "y_score": y_score,
+                    "source_cell_ratio": source_cell_ratio,
+                    "tile_ratio": tile_ratio,
+                    "ratio_error": ratio_error,
+                    "total_faces": total_faces,
+                    "pair_score": pair_score
+                }
+
+    if best_pair is None:
         return 1, 1, {
             "detected": False,
-            "reason": "cell_aspect_mismatch",
-            "x_score": round(x_score, 4),
-            "y_score": round(y_score, 4),
-            "source_cell_ratio": round(source_cell_ratio, 4),
-            "tile_ratio": round(tile_ratio, 4)
+            "reason": "no_compatible_grid_pair",
+            "tile_ratio": round(tile_ratio, 4),
+            "x_candidates": [
+                {"count": count, "score": round(score, 4)}
+                for count, score in x_candidates[:6]
+            ],
+            "y_candidates": [
+                {"count": count, "score": round(score, 4)}
+                for count, score in y_candidates[:6]
+            ]
         }
 
-    total_faces = cols * rows
-
-    if total_faces < 4 or total_faces > 900:
+    # Conservative minimum confidence, but lower than V2 because pairwise
+    # aspect matching itself is a strong validation signal.
+    if (
+        best_pair["x_score"] < 0.88 or
+        best_pair["y_score"] < 0.88 or
+        best_pair["pair_score"] < 1.15
+    ):
         return 1, 1, {
             "detected": False,
-            "reason": "face_count_out_of_range",
-            "x_score": round(x_score, 4),
-            "y_score": round(y_score, 4),
-            "total_faces": total_faces
+            "reason": "grid_pair_confidence_low",
+            "x_score": round(best_pair["x_score"], 4),
+            "y_score": round(best_pair["y_score"], 4),
+            "pair_score": round(best_pair["pair_score"], 4),
+            "source_cell_ratio": round(best_pair["source_cell_ratio"], 4),
+            "tile_ratio": round(best_pair["tile_ratio"], 4),
+            "cols_candidate": best_pair["cols"],
+            "rows_candidate": best_pair["rows"]
         }
 
-    return cols, rows, {
+    return best_pair["cols"], best_pair["rows"], {
         "detected": True,
-        "reason": "periodic_grid_detected",
-        "x_score": round(x_score, 4),
-        "y_score": round(y_score, 4),
-        "source_cell_ratio": round(source_cell_ratio, 4),
-        "tile_ratio": round(tile_ratio, 4),
-        "cols": cols,
-        "rows": rows,
-        "total_faces": total_faces
+        "reason": "compatible_grid_pair_detected",
+        "x_score": round(best_pair["x_score"], 4),
+        "y_score": round(best_pair["y_score"], 4),
+        "pair_score": round(best_pair["pair_score"], 4),
+        "source_cell_ratio": round(best_pair["source_cell_ratio"], 4),
+        "tile_ratio": round(best_pair["tile_ratio"], 4),
+        "ratio_error": round(best_pair["ratio_error"], 4),
+        "cols": best_pair["cols"],
+        "rows": best_pair["rows"],
+        "total_faces": best_pair["total_faces"],
+        "x_candidates": [
+            {"count": count, "score": round(score, 4)}
+            for count, score in x_candidates[:6]
+        ],
+        "y_candidates": [
+            {"count": count, "score": round(score, 4)}
+            for count, score in y_candidates[:6]
+        ]
     }
 
 
 def _extract_panel_faces(
+
     img: Image.Image,
     tile_width_cm: float,
     tile_height_cm: float,
@@ -643,7 +683,7 @@ def create_panel(req: PanelRequest):
             "panel_key": req.panel_key,
             "stage_tile_panel_url": upload_result.get("secure_url", ""),
             "panel_status": "panel_ready",
-            "panel_version": "auto_pl_face_v2",
+            "panel_version": "auto_pl_face_v3",
             "panel_meta": panel_meta
         }
 
