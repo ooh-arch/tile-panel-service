@@ -10,7 +10,7 @@ import os
 import math
 import hashlib
 
-SERVICE_VERSION = "TILE_PANEL_SERVICE_AUTO_PL_FACE_V4_ORIENTATION_NORMALIZER"
+SERVICE_VERSION = "TILE_PANEL_SERVICE_AUTO_PL_FACE_V5_HARMONIC_REFINEMENT"
 
 app = FastAPI(title="Tile Panel Service")
 
@@ -288,13 +288,14 @@ def _infer_panel_grid(
     """
     Infer a repeated face grid from a legacy _pl image.
 
-    V4 selects the X/Y grid as a pair and accepts either:
-    - native tile orientation: width x height
-    - rotated source orientation: height x width
+    V5 keeps the V4 native/rotated orientation logic and adds a conservative
+    harmonic-refinement pass. This fixes legacy source panels where a coarse
+    grid candidate (for example 4 x 2) is only a block containing several
+    real tile faces, while a finer harmonic candidate (for example 4 x 8)
+    has nearly the same confidence and strong seam evidence.
 
-    When a legacy Cloudinary _pl image stores the tile face rotated 90 degrees,
-    the detector records rotate_face_90=True so _extract_panel_faces can rotate
-    each cropped tile face back to the requested real tile orientation.
+    The refinement is intentionally conservative so normal panels are not
+    over-split because of texture or veining inside a tile face.
     """
     x_signal, x_length = _axis_boundary_signal(img, "x")
     y_signal, y_length = _axis_boundary_signal(img, "y")
@@ -305,8 +306,7 @@ def _infer_panel_grid(
     tile_ratio = tile_width_cm / max(1e-6, tile_height_cm)
     rotated_tile_ratio = tile_height_cm / max(1e-6, tile_width_cm)
 
-    best_pair = None
-    best_pair_score = float("-inf")
+    compatible_pairs = []
 
     for cols, x_score in x_candidates:
         for rows, y_score in y_candidates:
@@ -337,7 +337,6 @@ def _infer_panel_grid(
                 )
             )
 
-            # Square tiles do not need orientation correction.
             if abs(tile_width_cm - tile_height_cm) < 1e-6:
                 rotate_face_90 = False
                 ratio_error = native_ratio_error
@@ -354,11 +353,9 @@ def _infer_panel_grid(
                 matched_tile_ratio = tile_ratio
                 orientation_match = "native_source"
 
-            # Reject clearly impossible cell shapes.
             if ratio_error > 0.42:
                 continue
 
-            # Prefer seam evidence, then real tile aspect compatibility.
             aspect_score = max(0.0, 1.0 - (ratio_error / 0.42))
             pair_score = (
                 x_score * 0.38 +
@@ -366,30 +363,27 @@ def _infer_panel_grid(
                 aspect_score * 0.52
             )
 
-            # Mild penalty against implausibly dense grids.
             pair_score -= max(0, total_faces - 144) * 0.0015
 
-            if pair_score > best_pair_score:
-                best_pair_score = pair_score
-                best_pair = {
-                    "cols": cols,
-                    "rows": rows,
-                    "x_score": x_score,
-                    "y_score": y_score,
-                    "source_cell_ratio": source_cell_ratio,
-                    "tile_ratio": tile_ratio,
-                    "rotated_tile_ratio": rotated_tile_ratio,
-                    "matched_tile_ratio": matched_tile_ratio,
-                    "ratio_error": ratio_error,
-                    "native_ratio_error": native_ratio_error,
-                    "rotated_ratio_error": rotated_ratio_error,
-                    "orientation_match": orientation_match,
-                    "rotate_face_90": rotate_face_90,
-                    "total_faces": total_faces,
-                    "pair_score": pair_score
-                }
+            compatible_pairs.append({
+                "cols": cols,
+                "rows": rows,
+                "x_score": x_score,
+                "y_score": y_score,
+                "source_cell_ratio": source_cell_ratio,
+                "tile_ratio": tile_ratio,
+                "rotated_tile_ratio": rotated_tile_ratio,
+                "matched_tile_ratio": matched_tile_ratio,
+                "ratio_error": ratio_error,
+                "native_ratio_error": native_ratio_error,
+                "rotated_ratio_error": rotated_ratio_error,
+                "orientation_match": orientation_match,
+                "rotate_face_90": rotate_face_90,
+                "total_faces": total_faces,
+                "pair_score": pair_score
+            })
 
-    if best_pair is None:
+    if not compatible_pairs:
         return 1, 1, {
             "detected": False,
             "reason": "no_compatible_grid_pair",
@@ -406,8 +400,71 @@ def _infer_panel_grid(
             ]
         }
 
-    # Conservative minimum confidence, but pairwise aspect matching itself
-    # remains a strong validation signal.
+    compatible_pairs.sort(
+        key=lambda pair: pair["pair_score"],
+        reverse=True
+    )
+
+    base_pair = compatible_pairs[0]
+    best_pair = base_pair
+    selection_rule = "best_pair_score"
+
+    # Conservative harmonic refinement:
+    # - candidate must be a true integer refinement of the coarse pair
+    # - it must retain nearly the same total pair score
+    # - both axes must show strong seam evidence
+    # - aspect match must be very close
+    # - refinement factor is capped to avoid texture over-splitting
+    harmonic_candidates = []
+
+    for candidate in compatible_pairs[1:]:
+        if candidate["total_faces"] <= base_pair["total_faces"]:
+            continue
+
+        if candidate["cols"] % base_pair["cols"] != 0:
+            continue
+
+        if candidate["rows"] % base_pair["rows"] != 0:
+            continue
+
+        col_factor = candidate["cols"] // base_pair["cols"]
+        row_factor = candidate["rows"] // base_pair["rows"]
+        refinement_factor = col_factor * row_factor
+
+        if refinement_factor <= 1 or refinement_factor > 6:
+            continue
+
+        if candidate["pair_score"] < base_pair["pair_score"] - 0.06:
+            continue
+
+        if min(candidate["x_score"], candidate["y_score"]) < 1.15:
+            continue
+
+        if candidate["ratio_error"] > 0.08:
+            continue
+
+        # Most legacy orientation failures appear as a coarse native block
+        # whose finer harmonic is the true rotated tile grid. Keep this as a
+        # strong signal, while still allowing square tiles to remain stable.
+        if (
+            abs(tile_width_cm - tile_height_cm) >= 1e-6 and
+            candidate["orientation_match"] == base_pair["orientation_match"]
+        ):
+            continue
+
+        harmonic_candidates.append(candidate)
+
+    if harmonic_candidates:
+        harmonic_candidates.sort(
+            key=lambda pair: (
+                pair["total_faces"],
+                pair["pair_score"]
+            ),
+            reverse=True
+        )
+        best_pair = harmonic_candidates[0]
+        selection_rule = "strong_harmonic_refinement"
+
     if (
         best_pair["x_score"] < 0.88 or
         best_pair["y_score"] < 0.88 or
@@ -425,12 +482,14 @@ def _infer_panel_grid(
             "orientation_match": best_pair["orientation_match"],
             "rotate_face_90": best_pair["rotate_face_90"],
             "cols_candidate": best_pair["cols"],
-            "rows_candidate": best_pair["rows"]
+            "rows_candidate": best_pair["rows"],
+            "selection_rule": selection_rule
         }
 
     return best_pair["cols"], best_pair["rows"], {
         "detected": True,
         "reason": "compatible_grid_pair_detected",
+        "selection_rule": selection_rule,
         "x_score": round(best_pair["x_score"], 4),
         "y_score": round(best_pair["y_score"], 4),
         "pair_score": round(best_pair["pair_score"], 4),
@@ -446,6 +505,12 @@ def _infer_panel_grid(
         "cols": best_pair["cols"],
         "rows": best_pair["rows"],
         "total_faces": best_pair["total_faces"],
+        "base_pair_before_refinement": {
+            "cols": base_pair["cols"],
+            "rows": base_pair["rows"],
+            "pair_score": round(base_pair["pair_score"], 4),
+            "orientation_match": base_pair["orientation_match"]
+        },
         "x_candidates": [
             {"count": count, "score": round(score, 4)}
             for count, score in x_candidates[:6]
@@ -455,7 +520,6 @@ def _infer_panel_grid(
             for count, score in y_candidates[:6]
         ]
     }
-
 
 def _extract_panel_faces(
     img: Image.Image,
@@ -742,7 +806,7 @@ def create_panel(req: PanelRequest):
             "panel_key": req.panel_key,
             "stage_tile_panel_url": upload_result.get("secure_url", ""),
             "panel_status": "panel_ready",
-            "panel_version": "auto_pl_face_v4_orientation_normalizer",
+            "panel_version": "auto_pl_face_v5_harmonic_refinement",
             "panel_meta": panel_meta
         }
 
