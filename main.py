@@ -10,7 +10,7 @@ import os
 import math
 import hashlib
 
-SERVICE_VERSION = "TILE_PANEL_SERVICE_AUTO_PL_FACE_V3"
+SERVICE_VERSION = "TILE_PANEL_SERVICE_AUTO_PL_FACE_V4_ORIENTATION_NORMALIZER"
 
 app = FastAPI(title="Tile Panel Service")
 
@@ -288,9 +288,13 @@ def _infer_panel_grid(
     """
     Infer a repeated face grid from a legacy _pl image.
 
-    V3 selects the X/Y grid as a pair. This prevents a strong but incompatible
-    X count and Y count from being chosen independently, which caused square
-    60x60 legacy panels to be rejected as 1.6667:1 cells in V2.
+    V4 selects the X/Y grid as a pair and accepts either:
+    - native tile orientation: width x height
+    - rotated source orientation: height x width
+
+    When a legacy Cloudinary _pl image stores the tile face rotated 90 degrees,
+    the detector records rotate_face_90=True so _extract_panel_faces can rotate
+    each cropped tile face back to the requested real tile orientation.
     """
     x_signal, x_length = _axis_boundary_signal(img, "x")
     y_signal, y_length = _axis_boundary_signal(img, "y")
@@ -299,6 +303,7 @@ def _infer_panel_grid(
     y_candidates = _score_grid_counts(y_signal, y_length)
 
     tile_ratio = tile_width_cm / max(1e-6, tile_height_cm)
+    rotated_tile_ratio = tile_height_cm / max(1e-6, tile_width_cm)
 
     best_pair = None
     best_pair_score = float("-inf")
@@ -318,12 +323,36 @@ def _infer_panel_grid(
                 max(1e-6, (img.height / rows))
             )
 
-            ratio_error = abs(
+            native_ratio_error = abs(
                 math.log(
                     max(1e-6, source_cell_ratio) /
                     max(1e-6, tile_ratio)
                 )
             )
+
+            rotated_ratio_error = abs(
+                math.log(
+                    max(1e-6, source_cell_ratio) /
+                    max(1e-6, rotated_tile_ratio)
+                )
+            )
+
+            # Square tiles do not need orientation correction.
+            if abs(tile_width_cm - tile_height_cm) < 1e-6:
+                rotate_face_90 = False
+                ratio_error = native_ratio_error
+                matched_tile_ratio = tile_ratio
+                orientation_match = "native_square"
+            elif rotated_ratio_error + 1e-6 < native_ratio_error:
+                rotate_face_90 = True
+                ratio_error = rotated_ratio_error
+                matched_tile_ratio = rotated_tile_ratio
+                orientation_match = "rotated_source"
+            else:
+                rotate_face_90 = False
+                ratio_error = native_ratio_error
+                matched_tile_ratio = tile_ratio
+                orientation_match = "native_source"
 
             # Reject clearly impossible cell shapes.
             if ratio_error > 0.42:
@@ -349,7 +378,13 @@ def _infer_panel_grid(
                     "y_score": y_score,
                     "source_cell_ratio": source_cell_ratio,
                     "tile_ratio": tile_ratio,
+                    "rotated_tile_ratio": rotated_tile_ratio,
+                    "matched_tile_ratio": matched_tile_ratio,
                     "ratio_error": ratio_error,
+                    "native_ratio_error": native_ratio_error,
+                    "rotated_ratio_error": rotated_ratio_error,
+                    "orientation_match": orientation_match,
+                    "rotate_face_90": rotate_face_90,
                     "total_faces": total_faces,
                     "pair_score": pair_score
                 }
@@ -359,6 +394,8 @@ def _infer_panel_grid(
             "detected": False,
             "reason": "no_compatible_grid_pair",
             "tile_ratio": round(tile_ratio, 4),
+            "rotated_tile_ratio": round(rotated_tile_ratio, 4),
+            "rotate_face_90": False,
             "x_candidates": [
                 {"count": count, "score": round(score, 4)}
                 for count, score in x_candidates[:6]
@@ -369,8 +406,8 @@ def _infer_panel_grid(
             ]
         }
 
-    # Conservative minimum confidence, but lower than V2 because pairwise
-    # aspect matching itself is a strong validation signal.
+    # Conservative minimum confidence, but pairwise aspect matching itself
+    # remains a strong validation signal.
     if (
         best_pair["x_score"] < 0.88 or
         best_pair["y_score"] < 0.88 or
@@ -384,6 +421,9 @@ def _infer_panel_grid(
             "pair_score": round(best_pair["pair_score"], 4),
             "source_cell_ratio": round(best_pair["source_cell_ratio"], 4),
             "tile_ratio": round(best_pair["tile_ratio"], 4),
+            "rotated_tile_ratio": round(best_pair["rotated_tile_ratio"], 4),
+            "orientation_match": best_pair["orientation_match"],
+            "rotate_face_90": best_pair["rotate_face_90"],
             "cols_candidate": best_pair["cols"],
             "rows_candidate": best_pair["rows"]
         }
@@ -396,7 +436,13 @@ def _infer_panel_grid(
         "pair_score": round(best_pair["pair_score"], 4),
         "source_cell_ratio": round(best_pair["source_cell_ratio"], 4),
         "tile_ratio": round(best_pair["tile_ratio"], 4),
+        "rotated_tile_ratio": round(best_pair["rotated_tile_ratio"], 4),
+        "matched_tile_ratio": round(best_pair["matched_tile_ratio"], 4),
         "ratio_error": round(best_pair["ratio_error"], 4),
+        "native_ratio_error": round(best_pair["native_ratio_error"], 4),
+        "rotated_ratio_error": round(best_pair["rotated_ratio_error"], 4),
+        "orientation_match": best_pair["orientation_match"],
+        "rotate_face_90": best_pair["rotate_face_90"],
         "cols": best_pair["cols"],
         "rows": best_pair["rows"],
         "total_faces": best_pair["total_faces"],
@@ -412,7 +458,6 @@ def _infer_panel_grid(
 
 
 def _extract_panel_faces(
-
     img: Image.Image,
     tile_width_cm: float,
     tile_height_cm: float,
@@ -425,6 +470,10 @@ def _extract_panel_faces(
 
     The crop boundaries are calculated from the inferred grid. A tiny inset
     removes legacy grout pixels from each face before resizing.
+
+    If the legacy _pl source stores each tile face rotated 90 degrees compared
+    with the requested real tile dimensions, rotate every extracted face back
+    before fit_to_tile().
     """
     cols, rows, detection = _infer_panel_grid(
         img,
@@ -444,6 +493,8 @@ def _extract_panel_faces(
     inset_x = max(0, round(cell_width * 0.008))
     inset_y = max(0, round(cell_height * 0.008))
 
+    rotate_face_90 = bool(detection.get("rotate_face_90", False))
+
     for row in range(rows):
         for col in range(cols):
             left = round(col * cell_width) + inset_x
@@ -455,6 +506,10 @@ def _extract_panel_faces(
                 continue
 
             face = img.crop((left, top, right, bottom))
+
+            if rotate_face_90:
+                face = face.rotate(90, expand=True)
+
             face_images.append(
                 fit_to_tile(face, output_width_px, output_height_px)
             )
@@ -476,8 +531,12 @@ def _extract_panel_faces(
 
     detection["extracted_face_count"] = len(face_images)
     detection["max_faces"] = max_faces
+    detection["face_rotation_applied"] = (
+        "90_degrees" if rotate_face_90 else "none"
+    )
 
     return face_images, detection
+
 
 
 def pick_face_index(row: int, col: int, face_count: int, rule: str, seed_key: str) -> int:
@@ -683,7 +742,7 @@ def create_panel(req: PanelRequest):
             "panel_key": req.panel_key,
             "stage_tile_panel_url": upload_result.get("secure_url", ""),
             "panel_status": "panel_ready",
-            "panel_version": "auto_pl_face_v3",
+            "panel_version": "auto_pl_face_v4_orientation_normalizer",
             "panel_meta": panel_meta
         }
 
